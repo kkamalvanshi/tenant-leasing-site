@@ -215,6 +215,46 @@ async function callMCPTool(toolName: string, toolInput: Record<string, unknown>)
   }
 }
 
+// Helper to call Anthropic API with retry logic for rate limits
+async function callAnthropicWithRetry(
+  apiKey: string,
+  body: Record<string, unknown>,
+  maxRetries = 3
+): Promise<Response> {
+  let lastError: Error | null = null
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const response = await fetch(ANTHROPIC_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(body),
+    })
+    
+    if (response.ok) {
+      return response
+    }
+    
+    // Handle rate limit (429)
+    if (response.status === 429) {
+      const retryAfter = response.headers.get('retry-after')
+      const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 2000
+      console.log(`[API] Rate limited, waiting ${waitTime/1000}s before retry ${attempt + 1}/${maxRetries}`)
+      await new Promise(resolve => setTimeout(resolve, waitTime))
+      continue
+    }
+    
+    // Other errors - don't retry
+    lastError = new Error(`API error: ${response.status}`)
+    break
+  }
+  
+  throw lastError || new Error('Max retries exceeded')
+}
+
 // Process tool calls (non-streaming) and return the final messages array
 async function processToolCalls(
   apiKey: string,
@@ -224,25 +264,13 @@ async function processToolCalls(
   const toolsUsed: string[] = []
   const generatedFiles: FileAttachment[] = []
   
-  let response = await fetch(ANTHROPIC_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 4096,
-      system: SYSTEM_PROMPT,
-      tools: MCP_TOOLS,
-      messages: conversationMessages,
-    }),
+  let response = await callAnthropicWithRetry(apiKey, {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4096,
+    system: SYSTEM_PROMPT,
+    tools: MCP_TOOLS,
+    messages: conversationMessages,
   })
-
-  if (!response.ok) {
-    throw new Error(`API error: ${response.status}`)
-  }
 
   let data = await response.json()
   let loopCount = 0
@@ -279,25 +307,13 @@ async function processToolCalls(
       content: toolResults
     })
     
-    response = await fetch(ANTHROPIC_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        tools: MCP_TOOLS,
-        messages: conversationMessages,
-      }),
+    response = await callAnthropicWithRetry(apiKey, {
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system: SYSTEM_PROMPT,
+      tools: MCP_TOOLS,
+      messages: conversationMessages,
     })
-    
-    if (!response.ok) {
-      throw new Error(`API error: ${response.status}`)
-    }
     
     data = await response.json()
   }
@@ -338,29 +354,56 @@ export async function POST(request: NextRequest) {
       // Continue with original messages if tool processing fails
     }
 
-    // Now stream the final response
-    const streamResponse = await fetch(ANTHROPIC_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 4096,
-        system: SYSTEM_PROMPT,
-        stream: true,
-        messages: finalMessages,
-      }),
-    })
+    // Now stream the final response with retry logic
+    let streamResponse: Response | null = null
+    for (let attempt = 0; attempt < 3; attempt++) {
+      streamResponse = await fetch(ANTHROPIC_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          system: SYSTEM_PROMPT,
+          stream: true,
+          messages: finalMessages,
+        }),
+      })
 
-    if (!streamResponse.ok) {
-      const errorData = await streamResponse.text()
+      if (streamResponse.ok) break
+      
+      if (streamResponse.status === 429) {
+        const retryAfter = streamResponse.headers.get('retry-after')
+        const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : Math.pow(2, attempt) * 2000
+        console.log(`[API] Rate limited on stream, waiting ${waitTime/1000}s before retry ${attempt + 1}/3`)
+        await new Promise(resolve => setTimeout(resolve, waitTime))
+        continue
+      }
+      
+      break // Other errors, don't retry
+    }
+
+    if (!streamResponse || !streamResponse.ok) {
+      const errorData = streamResponse ? await streamResponse.text() : 'No response'
       console.error('Anthropic streaming API error:', errorData)
+      
+      // Return user-friendly error for rate limits
+      if (streamResponse?.status === 429) {
+        return new Response(
+          JSON.stringify({ 
+            error: 'Rate limit exceeded. Please wait a moment and try again.',
+            retryAfter: 30 
+          }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } }
+        )
+      }
+      
       return new Response(
-        JSON.stringify({ error: `API error: ${streamResponse.status}` }),
-        { status: streamResponse.status, headers: { 'Content-Type': 'application/json' } }
+        JSON.stringify({ error: `API error: ${streamResponse?.status || 'unknown'}` }),
+        { status: streamResponse?.status || 500, headers: { 'Content-Type': 'application/json' } }
       )
     }
 

@@ -58,10 +58,19 @@ export default function Home() {
       if (contentType?.includes('application/json')) {
         // Non-streaming error response
         const data = await response.json()
+        let errorContent = `⚠️ **Error:** ${data.error}`
+        
+        // Provide helpful context based on error type
+        if (response.status === 429 || data.error?.includes('Rate limit')) {
+          errorContent = `⏳ **Rate Limit Exceeded**\n\nThe API is temporarily rate limited. Please wait ${data.retryAfter || 30} seconds and try again.\n\n*This happens when too many requests are made in a short period.*`
+        } else if (response.status === 401 || data.error?.includes('API key')) {
+          errorContent = `🔑 **API Key Error**\n\nMake sure to add your Anthropic API key to \`.env.local\`:\n\`\`\`\nANTHROPIC_API_KEY=your-api-key-here\n\`\`\``
+        }
+        
         const errorMessage: Message = {
           id: (Date.now() + 1).toString(),
           role: 'assistant',
-          content: `⚠️ **Error:** ${data.error}\n\nMake sure to add your Anthropic API key to \`.env.local\`:\n\`\`\`\nANTHROPIC_API_KEY=your-api-key-here\n\`\`\``,
+          content: errorContent,
           timestamp: new Date(),
         }
         setMessages(prev => [...prev, errorMessage])
